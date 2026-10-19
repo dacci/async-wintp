@@ -1,15 +1,14 @@
 use crate::util::FutureState;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 
 pub use std::time::Duration;
 pub(crate) use threadpool::PoolTimer;
 
 struct SleepInner {
-    state: FutureState,
+    state: FutureState<()>,
     duration: Duration,
-    waker: Option<Waker>,
     timer: Option<PoolTimer>,
 }
 
@@ -23,8 +22,7 @@ impl Future for Sleep {
 
         match inner.state {
             FutureState::Init => {
-                inner.state = FutureState::Pending;
-                inner.waker = Some(cx.waker().clone());
+                inner.state.pending(cx.waker());
                 inner.timer.as_ref().expect("this must not occur").set(
                     Some(inner.duration),
                     None,
@@ -32,11 +30,17 @@ impl Future for Sleep {
                 );
                 Poll::Pending
             }
-            FutureState::Pending => {
-                inner.waker = Some(cx.waker().clone());
+            FutureState::Pending(_) => {
+                inner.state.pending(cx.waker());
                 Poll::Pending
             }
-            FutureState::Ready => Poll::Ready(()),
+            FutureState::Ready(_) => {
+                let FutureState::Ready(r) = inner.state.done() else {
+                    panic!("illegal future state");
+                };
+                Poll::Ready(r)
+            }
+            _ => panic!("illegal future state"),
         }
     }
 }
@@ -45,7 +49,6 @@ pub fn sleep(dur: Duration) -> Sleep {
     let inner = Arc::new(Mutex::new(SleepInner {
         state: FutureState::Init,
         duration: dur,
-        waker: None,
         timer: None,
     }));
 
@@ -54,9 +57,11 @@ pub fn sleep(dur: Duration) -> Sleep {
         let mut inner = cloned.lock().unwrap();
 
         match inner.state {
-            FutureState::Pending => {
-                inner.state = FutureState::Ready;
-                inner.waker.take().expect("this must not occur").wake();
+            FutureState::Pending(_) => {
+                let FutureState::Pending(w) = inner.state.ready(()) else {
+                    panic!("illegal sleep state");
+                };
+                w.wake();
             }
             _ => panic!("illegal sleep state"),
         }

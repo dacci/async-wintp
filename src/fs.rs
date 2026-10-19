@@ -7,7 +7,7 @@ use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 use windows_sys::Win32::Foundation::ERROR_IO_PENDING;
 use windows_sys::Win32::Storage::FileSystem::*;
 
@@ -168,8 +168,6 @@ impl File {
             buf,
             state: FutureState::Init,
             ov: None,
-            waker: None,
-            res: None,
         }));
 
         let cloned = Arc::clone(&inner);
@@ -180,9 +178,10 @@ impl File {
                 inner.f.pos += len as u64;
             }
 
-            inner.state = FutureState::Ready;
-            inner.res = Some(res);
-            inner.waker.take().expect("this mut not occur").wake();
+            let FutureState::Pending(w) = inner.state.ready(res) else {
+                panic!("illegal future state");
+            };
+            w.wake();
         };
 
         let mut guard = inner.lock().expect("this must not occur");
@@ -198,8 +197,6 @@ impl File {
             buf,
             state: FutureState::Init,
             ov: None,
-            waker: None,
-            res: None,
         }));
 
         let cloned = Arc::clone(&inner);
@@ -210,9 +207,10 @@ impl File {
                 inner.f.pos += len as u64;
             }
 
-            inner.state = FutureState::Ready;
-            inner.res = Some(res);
-            inner.waker.take().expect("this mut not occur").wake();
+            let FutureState::Pending(w) = inner.state.ready(res) else {
+                panic!("illegal future state");
+            };
+            w.wake();
         };
 
         let mut guard = inner.lock().expect("this must not occur");
@@ -226,10 +224,8 @@ impl File {
 struct ReadInner<'a> {
     f: &'a mut File,
     buf: &'a mut [u8],
-    state: FutureState,
+    state: FutureState<Result<usize>>,
     ov: Option<OverlappedCb<'a>>,
-    waker: Option<Waker>,
-    res: Option<Result<usize>>,
 }
 
 pub struct Read<'a>(Arc<Mutex<ReadInner<'a>>>);
@@ -262,20 +258,25 @@ impl Future for Read<'_> {
                     && let Some(code) = e.raw_os_error()
                     && code == ERROR_IO_PENDING as _
                 {
-                    inner.state = FutureState::Pending;
-                    inner.waker = Some(cx.waker().clone());
-                    return Poll::Pending;
+                    inner.state.pending(cx.waker());
+                    Poll::Pending
+                } else {
+                    inner.f.io.cancel();
+                    inner.state.done();
+                    Poll::Ready(if succeeded { Ok(len as _) } else { Err(e) })
                 }
-
-                inner.f.io.cancel();
-                inner.state = FutureState::Ready;
-                Poll::Ready(if succeeded { Ok(len as _) } else { Err(e) })
             }
-            FutureState::Pending => {
-                inner.waker = Some(cx.waker().clone());
+            FutureState::Pending(_) => {
+                inner.state.pending(cx.waker());
                 Poll::Pending
             }
-            FutureState::Ready => Poll::Ready(inner.res.take().expect("this must not occur")),
+            FutureState::Ready(_) => {
+                let FutureState::Ready(res) = inner.state.done() else {
+                    panic!("illegal future state");
+                };
+                Poll::Ready(res)
+            }
+            _ => panic!("illegal future state"),
         }
     }
 }
@@ -283,10 +284,8 @@ impl Future for Read<'_> {
 struct WriteInner<'a> {
     f: &'a mut File,
     buf: &'a [u8],
-    state: FutureState,
+    state: FutureState<Result<usize>>,
     ov: Option<OverlappedCb<'a>>,
-    waker: Option<Waker>,
-    res: Option<Result<usize>>,
 }
 
 pub struct Write<'a>(Arc<Mutex<WriteInner<'a>>>);
@@ -319,20 +318,25 @@ impl Future for Write<'_> {
                     && let Some(code) = err.raw_os_error()
                     && code == ERROR_IO_PENDING as _
                 {
-                    inner.state = FutureState::Pending;
-                    inner.waker = Some(cx.waker().clone());
-                    return Poll::Pending;
+                    inner.state.pending(cx.waker());
+                    Poll::Pending
+                } else {
+                    inner.f.io.cancel();
+                    inner.state.done();
+                    Poll::Ready(if succeeded { Ok(len as _) } else { Err(err) })
                 }
-
-                inner.f.io.cancel();
-                inner.state = FutureState::Ready;
-                Poll::Ready(if succeeded { Ok(len as _) } else { Err(err) })
             }
-            FutureState::Pending => {
-                inner.waker = Some(cx.waker().clone());
+            FutureState::Pending(_) => {
+                inner.state.pending(cx.waker());
                 Poll::Pending
             }
-            FutureState::Ready => Poll::Ready(inner.res.take().expect("this must not occur")),
+            FutureState::Ready(_) => {
+                let FutureState::Ready(res) = inner.state.done() else {
+                    panic!("illegal future state");
+                };
+                Poll::Ready(res)
+            }
+            _ => panic!("illegal future state"),
         }
     }
 }
