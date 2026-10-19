@@ -1,4 +1,3 @@
-use crate::util::AsFILETIME;
 use crate::{Error, Result};
 use std::ffi::c_void;
 use std::ptr::null;
@@ -42,11 +41,13 @@ impl PoolTimer {
     ///
     /// A worker thread calls the timer object's callback after the specified timeout expires.
     pub fn set(&self, due: Option<Duration>, period: Option<Duration>, window: Option<Duration>) {
+        let due = due.map(|d| crate::util::AsFILETIME::as_filetime(&d));
+
         unsafe {
             SetThreadpoolTimer(
                 self.handle,
-                match due {
-                    Some(due) => &due.as_filetime(),
+                match &due {
+                    Some(due) => due,
                     None => null(),
                 },
                 period.as_ref().map(Duration::as_millis).unwrap_or_default() as _,
