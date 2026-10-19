@@ -19,3 +19,4 @@ windows-sys = { version = "0.61.2", optional = true }
 fs = ["io", "windows-sys/Win32_Storage_FileSystem"]
 io = ["threadpool/io"]
 time = ["threadpool/timer"]
+full = ["fs", "io", "time"]
