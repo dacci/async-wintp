@@ -3,7 +3,7 @@ use std::task::Waker;
 
 #[allow(unused)]
 #[derive(Default)]
-pub(crate) enum FutureState<R> {
+pub enum FutureState<R> {
     #[default]
     Init,
 

@@ -1,7 +1,6 @@
-use crate::io::{Error, OverlappedCb, PoolIo, Result};
+use crate::io;
 use crate::util::FutureState;
 use std::fs::{File as StdFile, OpenOptions as StdOpenOptions};
-use std::ops::DerefMut;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
@@ -53,13 +52,13 @@ impl OpenOptions {
         self
     }
 
-    pub async fn open(&self, path: impl AsRef<Path>) -> Result<File> {
+    pub async fn open(&self, path: impl AsRef<Path>) -> io::Result<File> {
         let handle = self.0.open(path)?;
 
         let io = crate::runtime::current()
             .expect("not running in a runtime")
             .create_io(handle.as_raw_handle(), move |ov, res| {
-                let ov = unsafe { ov.cast::<OverlappedCb>().as_ref_unchecked() };
+                let ov = unsafe { ov.cast::<io::OverlappedCb>().as_ref_unchecked() };
                 ov.call(res);
             })?;
 
@@ -102,16 +101,16 @@ impl Default for OpenOptions {
 
 pub struct File {
     handle: StdFile,
-    io: PoolIo,
+    io: io::PoolIo,
     pos: u64,
 }
 
 impl File {
-    pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+    pub async fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         Self::options().read(true).open(path).await
     }
 
-    pub async fn create(path: impl AsRef<Path>) -> Result<Self> {
+    pub async fn create(path: impl AsRef<Path>) -> io::Result<Self> {
         Self::options()
             .write(true)
             .create(true)
@@ -120,7 +119,7 @@ impl File {
             .await
     }
 
-    pub async fn create_new(path: impl AsRef<Path>) -> Result<Self> {
+    pub async fn create_new(path: impl AsRef<Path>) -> io::Result<Self> {
         Self::options()
             .read(true)
             .write(true)
@@ -133,18 +132,18 @@ impl File {
         OpenOptions::new()
     }
 
-    pub async fn sync_all(&self) -> Result<()> {
+    pub async fn sync_all(&self) -> io::Result<()> {
         match unsafe { FlushFileBuffers(self.handle.as_raw_handle()) } {
-            0 => Err(Error::last_os_error()),
+            0 => Err(io::Error::last_os_error()),
             _ => Ok(()),
         }
     }
 
-    pub async fn sync_data(&self) -> Result<()> {
+    pub async fn sync_data(&self) -> io::Result<()> {
         self.sync_all().await
     }
 
-    pub async fn set_len(&self, size: u64) -> Result<()> {
+    pub async fn set_len(&self, size: u64) -> io::Result<()> {
         let info = FILE_END_OF_FILE_INFO {
             EndOfFile: size as _,
         };
@@ -157,184 +156,134 @@ impl File {
                 size_of::<FILE_END_OF_FILE_INFO>() as _,
             )
         } {
-            0 => Err(Error::last_os_error()),
+            0 => Err(io::Error::last_os_error()),
             _ => Ok(()),
         }
     }
-
-    pub fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> Read<'a> {
-        let inner = Arc::new(Mutex::new(ReadInner {
-            f: self,
-            buf,
-            state: FutureState::Init,
-            ov: None,
-        }));
-
-        let cloned = Arc::clone(&inner);
-        let work = move |res| {
-            let mut inner = cloned.lock().unwrap();
-
-            if let Ok(len) = res {
-                inner.f.pos += len as u64;
-            }
-
-            let FutureState::Pending(w) = inner.state.ready(res) else {
-                panic!("illegal future state");
-            };
-            w.wake();
-        };
-
-        let mut guard = inner.lock().expect("this must not occur");
-        guard.ov = Some(OverlappedCb::new(work));
-        drop(guard);
-
-        Read(inner)
-    }
-
-    pub fn write<'a>(&'a mut self, buf: &'a [u8]) -> Write<'a> {
-        let inner = Arc::new(Mutex::new(WriteInner {
-            f: self,
-            buf,
-            state: FutureState::Init,
-            ov: None,
-        }));
-
-        let cloned = Arc::clone(&inner);
-        let work = move |res| {
-            let mut inner = cloned.lock().unwrap();
-
-            if let Ok(len) = res {
-                inner.f.pos += len as u64;
-            }
-
-            let FutureState::Pending(w) = inner.state.ready(res) else {
-                panic!("illegal future state");
-            };
-            w.wake();
-        };
-
-        let mut guard = inner.lock().expect("this must not occur");
-        guard.ov = Some(OverlappedCb::new(work));
-        drop(guard);
-
-        Write(inner)
-    }
 }
 
-struct ReadInner<'a> {
-    f: &'a mut File,
-    buf: &'a mut [u8],
-    state: FutureState<Result<usize>>,
-    ov: Option<OverlappedCb<'a>>,
-}
+impl io::AsyncRead for File {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mx: &Arc<Mutex<io::ReadBuf<'_>>>,
+    ) -> Poll<io::Result<()>> {
+        let mut buf = mx.lock().unwrap();
 
-pub struct Read<'a>(Arc<Mutex<ReadInner<'a>>>);
-
-impl Future for Read<'_> {
-    type Output = Result<usize>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut inner = self.0.lock().unwrap();
-
-        match inner.state {
+        match buf.state() {
             FutureState::Init => {
-                let mut len = 0;
-                let pos = inner.f.pos;
-                inner.ov.as_mut().unwrap().set_offset(pos);
+                let cloned = Arc::clone(mx);
+                let work = move |res| {
+                    let mut inner = cloned.lock().unwrap();
 
-                inner.f.io.start();
+                    let FutureState::Pending(w) = inner.ready(res) else {
+                        panic!("illegal future state");
+                    };
+                    w.wake();
+                };
+
+                buf.set_offset(self.pos);
+                buf.set_callback(work);
+
+                let mut len = 0;
+
+                self.io.start();
                 let succeeded = unsafe {
                     ReadFile(
-                        inner.f.handle.as_raw_handle(),
-                        inner.buf.as_mut_ptr(),
-                        inner.buf.len() as _,
+                        self.handle.as_raw_handle(),
+                        buf.as_mut_ptr(),
+                        buf.len() as _,
                         &mut len,
-                        inner.ov.as_mut().unwrap().deref_mut(),
-                    )
-                } != 0;
-                let e = Error::last_os_error();
+                        buf.as_overlapped(),
+                    ) != 0
+                };
+                let e = io::Error::last_os_error();
 
                 if !succeeded
                     && let Some(code) = e.raw_os_error()
                     && code == ERROR_IO_PENDING as _
                 {
-                    inner.state.pending(cx.waker());
+                    buf.pending(cx.waker());
                     Poll::Pending
                 } else {
-                    inner.f.io.cancel();
-                    inner.state.done();
-                    Poll::Ready(if succeeded { Ok(len as _) } else { Err(e) })
+                    self.io.cancel();
+                    buf.ready(if succeeded { Ok(len as _) } else { Err(e) });
+                    Poll::Ready(Ok(()))
                 }
             }
             FutureState::Pending(_) => {
-                inner.state.pending(cx.waker());
+                buf.pending(cx.waker());
                 Poll::Pending
             }
-            FutureState::Ready(_) => {
-                let FutureState::Ready(res) = inner.state.done() else {
-                    panic!("illegal future state");
-                };
-                Poll::Ready(res)
+            FutureState::Ready(res) => {
+                if let Ok(len) = res {
+                    self.pos += *len as u64;
+                }
+                Poll::Ready(Ok(()))
             }
-            _ => panic!("illegal future state"),
+            _ => unreachable!(),
         }
     }
 }
 
-struct WriteInner<'a> {
-    f: &'a mut File,
-    buf: &'a [u8],
-    state: FutureState<Result<usize>>,
-    ov: Option<OverlappedCb<'a>>,
-}
+impl io::AsyncWrite for File {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mx: &Arc<Mutex<io::WriteBuf<'_>>>,
+    ) -> Poll<io::Result<()>> {
+        let mut buf = mx.lock().unwrap();
 
-pub struct Write<'a>(Arc<Mutex<WriteInner<'a>>>);
-
-impl Future for Write<'_> {
-    type Output = Result<usize>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut inner = self.0.lock().unwrap();
-
-        match inner.state {
+        match buf.state() {
             FutureState::Init => {
-                let mut len = 0;
-                let pos = inner.f.pos;
-                inner.ov.as_mut().unwrap().set_offset(pos);
+                let cloned = Arc::clone(mx);
+                let work = move |res| {
+                    let mut inner = cloned.lock().unwrap();
 
-                inner.f.io.start();
+                    let FutureState::Pending(w) = inner.ready(res) else {
+                        panic!("illegal future state");
+                    };
+                    w.wake();
+                };
+
+                buf.set_callback(work);
+                buf.set_offset(self.pos);
+
+                let mut len = 0;
+
+                self.io.start();
                 let succeeded = unsafe {
                     WriteFile(
-                        inner.f.handle.as_raw_handle(),
-                        inner.buf.as_ptr(),
-                        inner.buf.len() as _,
+                        self.handle.as_raw_handle(),
+                        buf.as_ptr(),
+                        buf.len() as _,
                         &mut len,
-                        inner.ov.as_mut().unwrap().deref_mut(),
-                    )
-                } != 0;
-                let err = Error::last_os_error();
+                        buf.as_overlapped(),
+                    ) != 0
+                };
+                let err = io::Error::last_os_error();
 
                 if !succeeded
                     && let Some(code) = err.raw_os_error()
                     && code == ERROR_IO_PENDING as _
                 {
-                    inner.state.pending(cx.waker());
+                    buf.pending(cx.waker());
                     Poll::Pending
                 } else {
-                    inner.f.io.cancel();
-                    inner.state.done();
-                    Poll::Ready(if succeeded { Ok(len as _) } else { Err(err) })
+                    self.io.cancel();
+                    buf.ready(if succeeded { Ok(len as _) } else { Err(err) });
+                    Poll::Ready(Ok(()))
                 }
             }
             FutureState::Pending(_) => {
-                inner.state.pending(cx.waker());
+                buf.pending(cx.waker());
                 Poll::Pending
             }
-            FutureState::Ready(_) => {
-                let FutureState::Ready(res) = inner.state.done() else {
-                    panic!("illegal future state");
-                };
-                Poll::Ready(res)
+            FutureState::Ready(res) => {
+                if let Ok(len) = res {
+                    self.pos += *len as u64;
+                }
+                Poll::Ready(Ok(()))
             }
             _ => panic!("illegal future state"),
         }
@@ -344,6 +293,7 @@ impl Future for Write<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn test_read() {
