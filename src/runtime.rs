@@ -29,6 +29,21 @@ impl Builder {
         self
     }
 
+    pub fn thread_maximum(&mut self, max: u32) -> &mut Self {
+        self.thread_maximum = Some(max);
+        self
+    }
+
+    pub fn thread_minimum(&mut self, min: u32) -> &mut Self {
+        self.thread_minimum = Some(min);
+        self
+    }
+
+    pub fn stack_info(&mut self, reserve: usize, commit: usize) -> &mut Self {
+        self.stack_info = Some((reserve, commit));
+        self
+    }
+
     pub fn build(self) -> Result<Runtime> {
         let pool = Pool::with_callback_priority(self.callback_priority)?;
 
